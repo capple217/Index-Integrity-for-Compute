@@ -1,6 +1,6 @@
 1. Ingest (all records whose time falls in step t)
 
-2. Normalize ($/GPU-hour on the baseline contract)
+2. Normalize ($/GPU-hour on the baseline contract lik rental type, country, cpu platform, gpu form)
 
 3. Panel (collapse each provider's records to one price [its median]; mark missing providers)
 
