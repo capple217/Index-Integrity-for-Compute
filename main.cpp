@@ -17,9 +17,45 @@
  * Deterministic
  * */
 
+typedef struct Config {
+  double h;
+  double delta;
+  double min_providers;
+  double min_scale;
+} Config;
+
+enum class ProvState { Active, Flagged, Held, Dropped };
+
 enum class Terms { on_demand, reserved, spot };
 
-typedef struct Quote {
+class Detector {
+public:
+  virtual ~Detector() = default;
+  // feed one residual; return true on alarm
+  virtual bool update(double z) = 0;
+  virtual double statistic() const = 0;
+  virtual void reset() = 0;
+};
+
+// behind an interface, so any other robust variant can be swapped in
+class TwoSidedCusum : public Detector {
+  double w_up, w_down;
+  double delta, h; // from Config
+public:
+  TwoSidedCusum(double up, double down) : w_up{up}, w_down{down} {}
+  bool update(double z) {
+    w_up = std::max(0.0, w_up + z - delta / 2);
+    w_down = std::max(0.0, w_down - z - delta / 2);
+    if (w_up >= h || w_down >= h)
+      return true;
+    return false;
+  }
+
+  double statistic() const override;
+  void reset() override;
+};
+
+struct Quote {
   int provider; // dense id 0...N-1
   int64_t t;    // step index
   double total_price;
@@ -28,12 +64,28 @@ typedef struct Quote {
   Terms terms;
 } Quote;
 
-typedef struct ProviderObs {
+struct ProviderObs {
   int provider;
   double price;         // $/GPU-hour, baseline
   int records;          // count this step
   bool present = false; // false = missing
 } ProviderObs;
+
+struct State {
+  std::vector<TwoSidedCusum> det; // One per provider
+  std::vector<ProvState> status;  // One per provider
+  std::vector<int> steps_in;      // steps spent in current status
+  std::vector<int> clean;         // consecutive in-line steps
+  std::vector<double> last_good;  // for carry-forward
+  double last_index;
+};
+
+struct StepResult {
+  int64_t t;
+  double index_value;
+  std::vector<Flag> flags;
+  bool degraded;
+};
 
 std::vector<Quote> ingest(int64_t t, char *records) {
   std::vector<Quote> vec;
@@ -51,7 +103,7 @@ double normalize(Quote &q) {
   // Multiply val by the factor per contract type to reach the baseline
   // factors determined by Terms
   // take Log of price starting here instead of outside the function
-  return val;
+  return std::log(val);
 }
 
 // seems to pick the upper median for even sizes
@@ -85,6 +137,8 @@ std::vector<ProviderObs> panel(std::vector<Quote> &quotes, int N) {
 }
 
 double consensus_center(std::vector<ProviderObs> &obs) {
+  if (obs.empty())
+    return 0.0;
   std::vector<double> vec;
   for (const auto &v : obs) {
     if (v.present)
@@ -97,6 +151,8 @@ double consensus_center(std::vector<ProviderObs> &obs) {
 double consensus_scale(double center, std::vector<ProviderObs> &obs) {
   std::vector<double> vec;
   for (const auto &v : obs) {
+    // also need to check if !held[v.provider] so need to construct container
+    // 'held'
     if (v.present)
       vec.push_back(std::fabs(v.price - center));
   }
@@ -118,25 +174,35 @@ std::vector<double> residuals(std::vector<ProviderObs> &panel, double center,
   return vec;
 }
 
-int process_step(int64_t t, char *records) {
+int process_step(int64_t t, char *records, State state, const Config &cfg) {
   std::vector<Quote> vec = ingest(t, records);
 
   // Define N outside
   int N = 10;
   auto panel_table = panel(vec, N);
 
+  // Check if we're under config.min_providers here to see if we should
+  // skip ahead to later steps aka define container 'config'
+
   // consensus
   double center = consensus_center(panel_table);
+  // floor the spread: scale = max(scale, config.min_scale)
   double scale = consensus_scale(center, panel_table);
 
-  // Check here for enough eligible providers
+  // Check here for enough eligible providers using config
   // If not, mark the step degraded and skips upcoming steps
 
   // Residuals
   std::vector<double> z = residuals(panel_table, center, scale, N);
+
+  // Might instantiate cusum from outside and call it per step so here
+  for (const auto &val : z) {
+    cusum::update(val);
+  }
 }
 
 int main() {
+  Config TwoSidedCusum cusum(0, 0);
   std::cout << "Hello World\n";
   return 0;
 }
